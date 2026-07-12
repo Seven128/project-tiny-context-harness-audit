@@ -52,6 +52,19 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm test
+      - name: Verify protected workflow trust pins
+        shell: bash
+        run: |
+          node --input-type=module - <<'NODE'
+          import { readFileSync } from "node:fs";
+          const source = readFileSync(".github/workflows/audit-candidate.yml", "utf8");
+          for (const required of [
+            "llvm-mingw-20260616-ucrt-x86_64.zip",
+            "b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35",
+            "docker run --rm --privileged",
+            "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+          ]) if (!source.includes(required)) throw new Error(`missing protected workflow pin: ${required}`);
+          NODE
 
   audit:
     if: github.event_name == 'workflow_dispatch'
@@ -229,13 +242,6 @@ jobs:
           }
           "HOST_RELEASE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "HOST_RELEASE_SHA256=$env:HOST_RELEASE_SHA256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Install Linux sandbox and browser system libraries
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
-          sudo npx --yes playwright@1.61.1 install-deps chromium
       - name: Generate disposable provisional result key
         shell: pwsh
         run: |
@@ -256,15 +262,48 @@ jobs:
         env:
           AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
-          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS,TY_CONTEXT_AUDIT_CANDIDATE_UID,TY_CONTEXT_AUDIT_CANDIDATE_GID node "$AUDIT_CLI" \
-            --candidate "$CANDIDATE_TARBALL" \
-            --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
-            --host-release "$HOST_RELEASE_ARCHIVE" \
-            --host-release-sha256 "$HOST_RELEASE_SHA256" \
-            --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
-            --signing-key "$PROVISIONAL_AUDIT_KEY" \
-            --signing-key-id "$PROVISIONAL_AUDIT_KEY_ID" \
-            --result "$AUDIT_RESULT_PATH"
+          node_bin=$(readlink -f "$(command -v node)")
+          node_root=$(cd "$(dirname "$node_bin")/.." && pwd)
+          docker run --rm --privileged \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume "$RUNNER_TEMP:$RUNNER_TEMP" \
+            --volume "$node_root:$node_root:ro" \
+            --workdir "$GITHUB_WORKSPACE" \
+            --env "NODE_ROOT=$node_root" \
+            --env GITHUB_WORKSPACE \
+            --env RUNNER_TEMP \
+            --env AUDIT_CLI \
+            --env CANDIDATE_TARBALL \
+            --env PROVISIONAL_AUDIT_KEY \
+            --env PROVISIONAL_AUDIT_KEY_ID \
+            --env AUDIT_PACKAGE_INTEGRITY \
+            --env HOST_RELEASE_ARCHIVE \
+            --env HOST_RELEASE_SHA256 \
+            --env AUDIT_RESULT_PATH \
+            --env TY_CONTEXT_AUDIT_CANDIDATE_UID \
+            --env TY_CONTEXT_AUDIT_CANDIDATE_GID \
+            --env CI=1 \
+            --env GITHUB_ACTIONS=true \
+            --env HTTP_PROXY \
+            --env HTTPS_PROXY \
+            --env NO_PROXY \
+            ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            bash -euo pipefail -c '
+              export PATH="$NODE_ROOT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              apt-get update -qq
+              apt-get install -y -qq bubblewrap ca-certificates git
+              "$NODE_ROOT/bin/npx" --yes playwright@1.61.1 install-deps chromium
+              git config --global --add safe.directory "$GITHUB_WORKSPACE"
+              "$NODE_ROOT/bin/node" "$AUDIT_CLI" \
+                --candidate "$CANDIDATE_TARBALL" \
+                --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
+                --host-release "$HOST_RELEASE_ARCHIVE" \
+                --host-release-sha256 "$HOST_RELEASE_SHA256" \
+                --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
+                --signing-key "$PROVISIONAL_AUDIT_KEY" \
+                --signing-key-id "$PROVISIONAL_AUDIT_KEY_ID" \
+                --result "$AUDIT_RESULT_PATH"
+            '
       - name: Run exact installed audit package on Windows
         if: matrix.platform == 'windows'
         shell: pwsh
