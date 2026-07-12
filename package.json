@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "audit": "node src/cli.mjs",
+    "test": "npm run self-test",
     "self-test": "node src/cli.mjs --self-test"
   },
   "engines": {

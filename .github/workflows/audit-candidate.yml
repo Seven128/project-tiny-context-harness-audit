@@ -15,6 +15,22 @@ on:
         description: Main-repository commit receiving the required check
         required: true
         type: string
+      linux_host_release_url:
+        description: Immutable official Linux x64 Host release URL
+        required: true
+        type: string
+      linux_host_release_sha256:
+        description: Exact official Linux x64 Host release SHA-256
+        required: true
+        type: string
+      windows_host_release_url:
+        description: Immutable official Windows x64 Host release URL
+        required: true
+        type: string
+      windows_host_release_sha256:
+        description: Exact official Windows x64 Host release SHA-256
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -58,7 +74,7 @@ jobs:
           EXPECTED_AUDIT_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
           npm ci --ignore-scripts
-          npm run self-test
+          npm test
           $packRoot = Join-Path $env:RUNNER_TEMP "audit-pack"
           $installRoot = Join-Path $env:RUNNER_TEMP "audit-install"
           New-Item -ItemType Directory -Force $packRoot, $installRoot | Out-Null
@@ -86,7 +102,7 @@ jobs:
           node -e "const fs=require('node:fs'),c=require('node:crypto');for(const p of process.argv.slice(1)){console.log(c.createHash('sha256').update(fs.readFileSync(p)).digest('hex'))}" $candidate $rebuilt | Tee-Object -Variable hashes
           if ($hashes[0] -ne $hashes[1] -or $hashes[0] -ne $env:CANDIDATE_SHA256) { throw "candidate tarball does not match candidate commit" }
           "CANDIDATE_TARBALL=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Build candidate Host binaries before creating audit keys
+      - name: Build exact-commit candidate Host binaries
         shell: pwsh
         run: |
           cargo build --release --locked --manifest-path candidate-source/host/ty-context-host-helper/Cargo.toml
@@ -94,6 +110,17 @@ jobs:
           "TY_CONTEXT_HOST_HELPER_BIN=$(Join-Path $release 'ty-context-host-helper${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TY_CONTEXT_HOST_ADMIN_BIN=$(Join-Path $release 'ty-context-host-admin${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TY_CONTEXT_HOST_INSTALLER_UI_BIN=$(Join-Path $release 'ty-context-host-installer-ui${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Download, verify, and bind the pre-signed Host release
+        shell: pwsh
+        env:
+          HOST_RELEASE_URL: ${{ matrix.platform == 'linux' && inputs.linux_host_release_url || inputs.windows_host_release_url }}
+          HOST_RELEASE_SHA256: ${{ matrix.platform == 'linux' && inputs.linux_host_release_sha256 || inputs.windows_host_release_sha256 }}
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "host-release-${{ matrix.platform }}.tgz"
+          node -e "const fs=require('node:fs');fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error('host release download '+r.status);return r.arrayBuffer()}).then(b=>fs.writeFileSync(process.argv[2],Buffer.from(b)))" $env:HOST_RELEASE_URL $archive
+          node $env:AUDIT_CLI --verify-host-release-candidate $archive --host-release-sha256 $env:HOST_RELEASE_SHA256 --candidate-source (Resolve-Path candidate-source) --helper $env:TY_CONTEXT_HOST_HELPER_BIN --admin $env:TY_CONTEXT_HOST_ADMIN_BIN --installer-ui $env:TY_CONTEXT_HOST_INSTALLER_UI_BIN
+          "HOST_RELEASE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HOST_RELEASE_SHA256=$env:HOST_RELEASE_SHA256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install Linux sandbox and browser system libraries
         if: matrix.platform == 'linux'
         shell: bash
@@ -101,19 +128,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
           sudo npx --yes playwright@1.61.1 install-deps chromium
-      - name: Generate per-job Host and provisional result keys
+      - name: Generate disposable provisional result key
         shell: pwsh
         run: |
-          node -e "const fs=require('node:fs'),c=require('node:crypto'),p=require('node:path');for(const [stem,keyEnv,idEnv] of [['host','TY_CONTEXT_HOST_RELEASE_ROOT_PRIVATE_KEY','HOST_KEY_ID'],['provisional','PROVISIONAL_AUDIT_KEY','PROVISIONAL_AUDIT_KEY_ID']]){const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const file=p.join(process.env.RUNNER_TEMP,stem+'-private.pem');fs.writeFileSync(file,privateKey.export({type:'pkcs8',format:'pem'}));const id=c.createHash('sha256').update(publicKey.export({type:'spki',format:'der'})).digest('hex');fs.appendFileSync(process.env.GITHUB_ENV,keyEnv+'='+file+'\n'+idEnv+'='+id+'\n');}"
+          node -e "const fs=require('node:fs'),c=require('node:crypto'),p=require('node:path');const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const file=p.join(process.env.RUNNER_TEMP,'provisional-private.pem');fs.writeFileSync(file,privateKey.export({type:'pkcs8',format:'pem'}));const id=c.createHash('sha256').update(publicKey.export({type:'spki',format:'der'})).digest('hex');fs.appendFileSync(process.env.GITHUB_ENV,'PROVISIONAL_AUDIT_KEY='+file+'\nPROVISIONAL_AUDIT_KEY_ID='+id+'\n');"
       - name: Run exact installed audit package on Linux
         if: matrix.platform == 'linux'
         shell: bash
         env:
           AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
-          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,TY_CONTEXT_HOST_HELPER_BIN,TY_CONTEXT_HOST_ADMIN_BIN,TY_CONTEXT_HOST_INSTALLER_UI_BIN,TY_CONTEXT_HOST_RELEASE_ROOT_PRIVATE_KEY,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS node "$AUDIT_CLI" \
+          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS node "$AUDIT_CLI" \
             --candidate "$CANDIDATE_TARBALL" \
             --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
+            --host-release "$HOST_RELEASE_ARCHIVE" \
+            --host-release-sha256 "$HOST_RELEASE_SHA256" \
             --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
             --signing-key "$PROVISIONAL_AUDIT_KEY" \
             --signing-key-id "$PROVISIONAL_AUDIT_KEY_ID" \
@@ -124,7 +153,7 @@ jobs:
         env:
           AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
-          node $env:AUDIT_CLI --candidate $env:CANDIDATE_TARBALL --candidate-sha256 "${{ inputs.candidate_sha256 }}" --audit-integrity $env:AUDIT_PACKAGE_INTEGRITY --signing-key $env:PROVISIONAL_AUDIT_KEY --signing-key-id $env:PROVISIONAL_AUDIT_KEY_ID --result (Join-Path $env:RUNNER_TEMP "external-audit-result-${{ matrix.platform }}.json")
+          node $env:AUDIT_CLI --candidate $env:CANDIDATE_TARBALL --candidate-sha256 "${{ inputs.candidate_sha256 }}" --host-release $env:HOST_RELEASE_ARCHIVE --host-release-sha256 $env:HOST_RELEASE_SHA256 --audit-integrity $env:AUDIT_PACKAGE_INTEGRITY --signing-key $env:PROVISIONAL_AUDIT_KEY --signing-key-id $env:PROVISIONAL_AUDIT_KEY_ID --result (Join-Path $env:RUNNER_TEMP "external-audit-result-${{ matrix.platform }}.json")
       - uses: actions/upload-artifact@v4
         with:
           name: raw-external-audit-result-${{ matrix.platform }}
@@ -152,7 +181,7 @@ jobs:
           EXPECTED_AUDIT_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
           npm ci --ignore-scripts
-          npm run self-test
+          npm test
           mkdir -p "$RUNNER_TEMP/audit-pack" "$RUNNER_TEMP/audit-install"
           name=$(npm pack --silent --pack-destination "$RUNNER_TEMP/audit-pack")
           tarball="$RUNNER_TEMP/audit-pack/$name"
@@ -175,9 +204,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/signed"
           for platform in linux windows; do
+            if [ "$platform" = linux ]; then host_sha='${{ inputs.linux_host_release_sha256 }}'; else host_sha='${{ inputs.windows_host_release_sha256 }}'; fi
             node "$AUDIT_CLI" \
               --resign-result "$RUNNER_TEMP/raw/external-audit-result-$platform.json" \
               --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
+              --host-release-sha256 "$host_sha" \
               --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
               --signing-key "$RUNNER_TEMP/external-audit-private.pem" \
               --signing-key-id "$AUDIT_SIGNING_KEY_ID" \
@@ -214,4 +245,4 @@ jobs:
             -f conclusion=success \
             -f details_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' \
             -f 'output[title]=Independent Contract V3 audit passed' \
-            -f 'output[summary]=Linux and Windows full-scope signed audits passed for the exact candidate tarball.'
+            -f 'output[summary]=Linux and Windows full-scope signed audits passed for the exact candidate tarball and pre-signed target Host releases; candidate jobs received no Host root or durable audit signing key.'
