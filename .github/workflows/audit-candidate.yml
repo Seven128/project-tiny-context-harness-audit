@@ -63,11 +63,43 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Provision an unprivileged candidate identity on Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin tycontextaudit
+          echo "TY_CONTEXT_AUDIT_CANDIDATE_UID=$(id -u tycontextaudit)" >> "$GITHUB_ENV"
+          echo "TY_CONTEXT_AUDIT_CANDIDATE_GID=$(id -g tycontextaudit)" >> "$GITHUB_ENV"
+      - name: Provision an unprivileged candidate identity on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $user = "tycontextaudit"
+          $password = "Tyc!" + [guid]::NewGuid().ToString("N") + "9a"
+          net user $user $password /add /passwordchg:no /expires:never | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to create standard candidate user" }
+          "TY_CONTEXT_AUDIT_WINDOWS_USER=$user" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TY_CONTEXT_AUDIT_WINDOWS_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          icacls $env:GITHUB_WORKSPACE /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "$user`:(OI)(CI)RX" /T /C | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to protect audit workspace" }
       - name: Select declared Rust toolchain
         shell: pwsh
         run: |
+          $rustupHome = Join-Path $env:RUNNER_TEMP "audit-rustup-home"
+          $proxyRoot = Join-Path $env:RUNNER_TEMP "audit-rustup-proxy"
+          New-Item -ItemType Directory -Force $rustupHome, $proxyRoot | Out-Null
+          $env:RUSTUP_HOME = $rustupHome
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
+          $target = if ("${{ matrix.platform }}" -eq "windows") { "x86_64-pc-windows-gnullvm" } else { "x86_64-unknown-linux-gnu" }
+          rustup target add $target --toolchain 1.97.0
+          $proxyName = if ("${{ matrix.platform }}" -eq "windows") { "cargo.exe" } else { "cargo" }
+          $cargoProxy = Join-Path $proxyRoot $proxyName
+          node -e "const fs=require('node:fs');fs.copyFileSync(fs.realpathSync(process.argv[1]),process.argv[2]);" (Get-Command rustup).Source $cargoProxy
+          if ($IsLinux) { chmod 755 $cargoProxy }
+          "RUSTUP_HOME=$rustupHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TY_CONTEXT_AUDIT_CARGO_BIN=$cargoProxy" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HOST_BUILD_TARGET=$target" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install audit dependencies and verify release package identity
         shell: pwsh
         env:
@@ -75,6 +107,9 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm test
+          $npmCli = Join-Path ((npm root --global).Trim()) "npm/bin/npm-cli.js"
+          if (-not (Test-Path -LiteralPath $npmCli -PathType Leaf)) { throw "trusted npm CLI not found: $npmCli" }
+          "TY_CONTEXT_AUDIT_NPM_CLI=$npmCli" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $packRoot = Join-Path $env:RUNNER_TEMP "audit-pack"
           $installRoot = Join-Path $env:RUNNER_TEMP "audit-install"
           New-Item -ItemType Directory -Force $packRoot, $installRoot | Out-Null
@@ -83,6 +118,10 @@ jobs:
           node -e "const fs=require('node:fs'),c=require('node:crypto');const sri='sha512-'+c.createHash('sha512').update(fs.readFileSync(process.argv[1])).digest('base64');if(sri!==process.argv[2])throw new Error('audit package integrity mismatch');" $tarball $env:EXPECTED_AUDIT_INTEGRITY
           Set-Content -Encoding utf8NoBOM (Join-Path $installRoot "package.json") '{"private":true}'
           npm install --prefix $installRoot --ignore-scripts --no-audit --no-fund --package-lock=false $tarball
+          if ("${{ matrix.platform }}" -eq "windows") {
+            icacls $installRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "$env:TY_CONTEXT_AUDIT_WINDOWS_USER`:(OI)(CI)RX" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to protect installed audit package" }
+          }
           "AUDIT_CLI=$(Join-Path $installRoot 'node_modules/project-tiny-context-harness-audit/src/cli.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Download and bind candidate tarball to the checked commit
         shell: pwsh
@@ -93,20 +132,48 @@ jobs:
           $candidate = Join-Path $env:RUNNER_TEMP "candidate.tgz"
           node -e "const fs=require('node:fs');fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error('candidate download '+r.status);return r.arrayBuffer()}).then(b=>fs.writeFileSync(process.argv[2],Buffer.from(b)))" $env:CANDIDATE_URL $candidate
           node -e "const fs=require('node:fs'),c=require('node:crypto');const actual=c.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex');if(actual!==process.argv[2])throw new Error('candidate sha256 mismatch');" $candidate $env:CANDIDATE_SHA256
-          npm ci --prefix candidate-source --ignore-scripts
-          npm run build --prefix candidate-source --workspace project-tiny-context-harness
+          if ("${{ matrix.platform }}" -eq "linux") {
+            sudo chown root:root $candidate
+            sudo chmod 600 $candidate
+          } else {
+            icacls $candidate /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+          }
           $repack = Join-Path $env:RUNNER_TEMP "candidate-repack"
           New-Item -ItemType Directory -Force $repack | Out-Null
-          $name = npm pack --silent --prefix candidate-source --workspace project-tiny-context-harness --ignore-scripts --pack-destination $repack
-          $rebuilt = Join-Path $repack $name.Trim()
-          node -e "const fs=require('node:fs'),c=require('node:crypto');for(const p of process.argv.slice(1)){console.log(c.createHash('sha256').update(fs.readFileSync(p)).digest('hex'))}" $candidate $rebuilt | Tee-Object -Variable hashes
-          if ($hashes[0] -ne $hashes[1] -or $hashes[0] -ne $env:CANDIDATE_SHA256) { throw "candidate tarball does not match candidate commit" }
+          if ("${{ matrix.platform }}" -eq "linux") {
+            sudo --preserve-env=TY_CONTEXT_AUDIT_CANDIDATE_UID,TY_CONTEXT_AUDIT_CANDIDATE_GID,PATH,GITHUB_ACTIONS node $env:AUDIT_CLI --bind-candidate-artifact $candidate --candidate-source (Resolve-Path candidate-source) --candidate-sha256 $env:CANDIDATE_SHA256 --output-dir $repack --npm-cli $env:TY_CONTEXT_AUDIT_NPM_CLI
+          } else {
+            node $env:AUDIT_CLI --bind-candidate-artifact $candidate --candidate-source (Resolve-Path candidate-source) --candidate-sha256 $env:CANDIDATE_SHA256 --output-dir $repack --npm-cli $env:TY_CONTEXT_AUDIT_NPM_CLI
+          }
           "CANDIDATE_TARBALL=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build exact-commit candidate Host binaries
         shell: pwsh
         run: |
-          cargo build --release --locked --manifest-path candidate-source/host/ty-context-host-helper/Cargo.toml
-          $release = Resolve-Path "candidate-source/host/ty-context-host-helper/target/release"
+          $manifest = Resolve-Path "candidate-source/host/ty-context-host-helper/Cargo.toml"
+          $cargoHome = Join-Path $env:RUNNER_TEMP "candidate-cargo-home"
+          New-Item -ItemType Directory -Force $cargoHome | Out-Null
+          $env:CARGO_HOME = $cargoHome
+          cargo fetch --locked --target $env:HOST_BUILD_TARGET --manifest-path $manifest
+          $cargoBin = $env:TY_CONTEXT_AUDIT_CARGO_BIN
+          $rustupHome = (rustup show home).Trim()
+          if ($IsLinux) {
+            $candidateOwner = $env:TY_CONTEXT_AUDIT_CANDIDATE_UID + ":" + $env:TY_CONTEXT_AUDIT_CANDIDATE_GID
+            sudo chown -R $candidateOwner $cargoHome
+            sudo chmod -R a+rX $rustupHome (Split-Path $cargoBin -Parent)
+            $env:RUSTUP_HOME = $rustupHome
+            $env:CARGO_NET_OFFLINE = "true"
+            sudo --preserve-env=TY_CONTEXT_AUDIT_CANDIDATE_UID,TY_CONTEXT_AUDIT_CANDIDATE_GID,PATH,RUSTUP_HOME,CARGO_HOME,CARGO_NET_OFFLINE,GITHUB_ACTIONS node $env:AUDIT_CLI --build-host-candidate (Resolve-Path candidate-source) --cargo-bin $cargoBin --target $env:HOST_BUILD_TARGET
+          } else {
+            $modifyGrant = $env:TY_CONTEXT_AUDIT_WINDOWS_USER + ":(OI)(CI)M"
+            $readGrant = $env:TY_CONTEXT_AUDIT_WINDOWS_USER + ":(OI)(CI)RX"
+            icacls $cargoHome /grant:r $modifyGrant /T /C | Out-Null
+            icacls $rustupHome /grant:r $readGrant /T /C | Out-Null
+            icacls (Split-Path $cargoBin -Parent) /grant:r $readGrant /T /C /L | Out-Null
+            $env:RUSTUP_HOME = $rustupHome
+            $env:CARGO_NET_OFFLINE = "true"
+            node $env:AUDIT_CLI --build-host-candidate (Resolve-Path candidate-source) --cargo-bin $cargoBin --target $env:HOST_BUILD_TARGET
+          }
+          $release = Resolve-Path "candidate-source/host/ty-context-host-helper/target/$env:HOST_BUILD_TARGET/release"
           "TY_CONTEXT_HOST_HELPER_BIN=$(Join-Path $release 'ty-context-host-helper${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TY_CONTEXT_HOST_ADMIN_BIN=$(Join-Path $release 'ty-context-host-admin${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TY_CONTEXT_HOST_INSTALLER_UI_BIN=$(Join-Path $release 'ty-context-host-installer-ui${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -119,6 +186,13 @@ jobs:
           $archive = Join-Path $env:RUNNER_TEMP "host-release-${{ matrix.platform }}.tgz"
           node -e "const fs=require('node:fs');fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error('host release download '+r.status);return r.arrayBuffer()}).then(b=>fs.writeFileSync(process.argv[2],Buffer.from(b)))" $env:HOST_RELEASE_URL $archive
           node $env:AUDIT_CLI --verify-host-release-candidate $archive --host-release-sha256 $env:HOST_RELEASE_SHA256 --candidate-source (Resolve-Path candidate-source) --helper $env:TY_CONTEXT_HOST_HELPER_BIN --admin $env:TY_CONTEXT_HOST_ADMIN_BIN --installer-ui $env:TY_CONTEXT_HOST_INSTALLER_UI_BIN
+          if ($IsLinux) {
+            sudo chown root:root $archive
+            sudo chmod 600 $archive
+          } else {
+            icacls $archive /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to protect Host release archive" }
+          }
           "HOST_RELEASE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "HOST_RELEASE_SHA256=$env:HOST_RELEASE_SHA256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install Linux sandbox and browser system libraries
@@ -131,14 +205,24 @@ jobs:
       - name: Generate disposable provisional result key
         shell: pwsh
         run: |
-          node -e "const fs=require('node:fs'),c=require('node:crypto'),p=require('node:path');const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const file=p.join(process.env.RUNNER_TEMP,'provisional-private.pem');fs.writeFileSync(file,privateKey.export({type:'pkcs8',format:'pem'}));const id=c.createHash('sha256').update(publicKey.export({type:'spki',format:'der'})).digest('hex');fs.appendFileSync(process.env.GITHUB_ENV,'PROVISIONAL_AUDIT_KEY='+file+'\nPROVISIONAL_AUDIT_KEY_ID='+id+'\n');"
+          node -e "const fs=require('node:fs'),c=require('node:crypto'),p=require('node:path');const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const file=p.join(process.env.RUNNER_TEMP,'provisional-private.pem');fs.writeFileSync(file,privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});const id=c.createHash('sha256').update(publicKey.export({type:'spki',format:'der'})).digest('hex');fs.appendFileSync(process.env.GITHUB_ENV,'PROVISIONAL_AUDIT_KEY='+file+'\nPROVISIONAL_AUDIT_KEY_ID='+id+'\n');"
+          $resultRoot = Join-Path $env:RUNNER_TEMP "audit-result"
+          New-Item -ItemType Directory -Force $resultRoot | Out-Null
+          if ("${{ matrix.platform }}" -eq "windows") {
+            icacls (Join-Path $env:RUNNER_TEMP "provisional-private.pem") /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+            icacls $resultRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+          } else {
+            chmod 600 (Join-Path $env:RUNNER_TEMP "provisional-private.pem")
+            chmod 700 $resultRoot
+          }
+          "AUDIT_RESULT_PATH=$(Join-Path $resultRoot 'external-audit-result-${{ matrix.platform }}.json')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run exact installed audit package on Linux
         if: matrix.platform == 'linux'
         shell: bash
         env:
           AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
-          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS node "$AUDIT_CLI" \
+          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS,TY_CONTEXT_AUDIT_CANDIDATE_UID,TY_CONTEXT_AUDIT_CANDIDATE_GID node "$AUDIT_CLI" \
             --candidate "$CANDIDATE_TARBALL" \
             --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
             --host-release "$HOST_RELEASE_ARCHIVE" \
@@ -146,19 +230,33 @@ jobs:
             --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
             --signing-key "$PROVISIONAL_AUDIT_KEY" \
             --signing-key-id "$PROVISIONAL_AUDIT_KEY_ID" \
-            --result "$RUNNER_TEMP/external-audit-result-${{ matrix.platform }}.json"
+            --result "$AUDIT_RESULT_PATH"
       - name: Run exact installed audit package on Windows
         if: matrix.platform == 'windows'
         shell: pwsh
         env:
           AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
         run: |
-          node $env:AUDIT_CLI --candidate $env:CANDIDATE_TARBALL --candidate-sha256 "${{ inputs.candidate_sha256 }}" --host-release $env:HOST_RELEASE_ARCHIVE --host-release-sha256 $env:HOST_RELEASE_SHA256 --audit-integrity $env:AUDIT_PACKAGE_INTEGRITY --signing-key $env:PROVISIONAL_AUDIT_KEY --signing-key-id $env:PROVISIONAL_AUDIT_KEY_ID --result (Join-Path $env:RUNNER_TEMP "external-audit-result-${{ matrix.platform }}.json")
+          node $env:AUDIT_CLI --candidate $env:CANDIDATE_TARBALL --candidate-sha256 "${{ inputs.candidate_sha256 }}" --host-release $env:HOST_RELEASE_ARCHIVE --host-release-sha256 $env:HOST_RELEASE_SHA256 --audit-integrity $env:AUDIT_PACKAGE_INTEGRITY --signing-key $env:PROVISIONAL_AUDIT_KEY --signing-key-id $env:PROVISIONAL_AUDIT_KEY_ID --result $env:AUDIT_RESULT_PATH
       - uses: actions/upload-artifact@v4
         with:
           name: raw-external-audit-result-${{ matrix.platform }}
-          path: ${{ runner.temp }}/external-audit-result-${{ matrix.platform }}.json
+          path: ${{ runner.temp }}/audit-result/external-audit-result-${{ matrix.platform }}.json
           if-no-files-found: error
+      - name: Remove temporary Windows candidate identity
+        if: ${{ always() && matrix.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          $user = Get-LocalUser -Name tycontextaudit -ErrorAction SilentlyContinue
+          if ($null -ne $user) { Remove-LocalUser -Name tycontextaudit }
+      - name: Remove temporary Linux candidate identity
+        if: ${{ always() && matrix.platform == 'linux' }}
+        shell: bash
+        run: |
+          if id tycontextaudit >/dev/null 2>&1; then
+            sudo pkill -KILL -u "$(id -u tycontextaudit)" 2>/dev/null || true
+            sudo userdel --force tycontextaudit
+          fi
 
   sign:
     name: sign-independent-results

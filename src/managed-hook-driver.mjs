@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
 import { createPublicKey, verify } from "node:crypto";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, chown, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { canonical, runProcess, sha256 } from "./candidate-installer.mjs";
 
@@ -31,17 +30,7 @@ export async function invokeManagedHook(ready, repository, event, input = {}) {
 }
 
 async function startLinuxManagedHost(candidate, source) {
-  const moduleAt = (relative) => import(pathToFileURL(path.join(candidate, ...relative.split("/"))).href);
-  const [{ managedHostLayout }, { renderManagedRequirementsV1 }, release, { LONG_TASK_HOST_RELEASE_ROOT_PUBLIC_KEY_PEM }, runtimeIdentity, codec] = await Promise.all([
-    moduleAt("dist/lib/long-task-managed-host-layout.js"),
-    moduleAt("dist/lib/long-task-managed-requirements.js"),
-    moduleAt("dist/lib/long-task-host-release.js"),
-    moduleAt("dist/lib/long-task-host-release-root.js"),
-    moduleAt("dist/lib/long-task-host-runtime-identity.js"),
-    moduleAt("dist/lib/composite-campaign-codec.js")
-  ]);
-  const layout = managedHostLayout("linux");
-  await release.verifyHostReleaseDirectoryV1(source, LONG_TASK_HOST_RELEASE_ROOT_PUBLIC_KEY_PEM, { platform: "linux", arch: process.arch });
+  const layout = hostLayout("linux"); const identity = linuxCandidateIdentity();
   const root = await mkdtemp(path.join(os.tmpdir(), "tyc-external-audit-host-"));
   const readyPath = path.join(root, "managed-host-ready.json");
   const codexDirectory = "/usr/local/libexec";
@@ -49,35 +38,13 @@ async function startLinuxManagedHost(candidate, source) {
   const codexScript = path.join(codexDirectory, "ty-context-external-audit-codex-launcher.mjs");
   await Promise.all([rm(layout.managed_dir, { recursive: true, force: true }), rm(layout.state_root, { recursive: true, force: true }), rm(layout.requirements_file, { force: true }), rm(layout.endpoint, { force: true })]);
   await Promise.all([mkdir(layout.managed_dir, { recursive: true }), mkdir(layout.state_root, { recursive: true }), mkdir(path.dirname(layout.requirements_file), { recursive: true }), mkdir(path.dirname(layout.endpoint), { recursive: true }), mkdir(codexDirectory, { recursive: true })]);
-  await Promise.all([
-    cp(path.join(source, "ty-context-host-helper"), layout.helper_path), cp(path.join(source, "ty-context-host-admin"), layout.admin_path), cp(path.join(source, "ty-context-host-installer-ui"), layout.installer_ui_path),
-    cp(path.join(source, "long-task-hook.mjs"), layout.hook_path), cp(path.join(source, "ty-context-host-worker.mjs"), layout.worker_path),
-    cp(path.join(source, "requirements.toml"), path.join(layout.managed_dir, "requirements.toml")), cp(path.join(source, "host-release-manifest.json"), layout.release_manifest_path), cp(path.join(source, "host-release-manifest.sig"), layout.release_signature_path), cp(path.join(source, "host-release-root-public.pem"), layout.release_root_public_key_path), cp(process.execPath, codexLauncher)
-  ]);
+  await copyHostRelease(source, layout); await cp(process.execPath, codexLauncher);
   await writeFile(codexScript, `import {spawnSync} from "node:child_process";const result=spawnSync(process.argv[2],process.argv.slice(3),{stdio:"inherit",windowsHide:true});process.exit(result.status??1);\n`);
-  await Promise.all([layout.helper_path, layout.admin_path, layout.installer_ui_path, codexLauncher].map((file) => chmod(file, 0o755)));
-  const requirements = renderManagedRequirementsV1(layout);
-  await writeFile(layout.requirements_file, requirements);
-  const manifestText = await readFile(layout.release_manifest_path, "utf8");
-  const cliPath = await realpath(path.join(candidate, "dist", "cli.js"));
-  const cliWorkerPath = await realpath(path.join(candidate, "dist", "lib", "long-task-host-worker-runtime.js"));
-  const cliRuntimeManifest = await runtimeIdentity.createManagedHostRuntimeManifestV1(cliPath);
-  const sandboxLauncher = await runtimeIdentity.resolveManagedSandboxLauncherV1(layout.helper_path, "linux");
-  const bytesHash = async (file) => codec.sha256Hex(await readFile(file));
-  const config = {
-    schema_version: "ty-context-host-service-config-v1", state_root: layout.state_root, endpoint: layout.endpoint, managed_dir: layout.managed_dir,
-    requirements_file: layout.requirements_file, node_path: await realpath(process.execPath), node_sha256: await bytesHash(process.execPath),
-    helper_path: layout.helper_path, sandbox_launcher_path: sandboxLauncher.path, sandbox_launcher_sha256: sandboxLauncher.sha256,
-    admin_path: layout.admin_path, admin_sha256: await bytesHash(layout.admin_path), installer_ui_path: layout.installer_ui_path, installer_ui_sha256: await bytesHash(layout.installer_ui_path),
-    codex_launcher_path: codexLauncher, codex_launcher_sha256: await bytesHash(codexLauncher), cli_path: cliPath, cli_sha256: await bytesHash(cliPath),
-    cli_worker_path: cliWorkerPath, cli_worker_sha256: await bytesHash(cliWorkerPath), cli_runtime_manifest: cliRuntimeManifest,
-    cli_runtime_manifest_sha256: runtimeIdentity.managedHostRuntimeManifestSha256V1(cliRuntimeManifest), hook_path: layout.hook_path, hook_sha256: await bytesHash(layout.hook_path),
-    worker_path: layout.worker_path, worker_sha256: await bytesHash(layout.worker_path), attestation_public_key_path: layout.attestation_public_key_path,
-    managed_policy_sha256: sha256(requirements), release_manifest_sha256: sha256(manifestText), test_namespace: false
-  };
-  await writeFile(layout.service_config_path, canonical(config));
+  const requirements = renderHostRequirements(layout, await realpath(process.execPath)); await writeFile(layout.requirements_file, requirements);
+  await writeHostConfig(candidate, layout, codexLauncher, requirements, "linux");
   await Promise.all([chmod(layout.managed_dir, 0o755), chmod(layout.state_root, 0o700), chmod(layout.requirements_file, 0o644), chmod(path.dirname(layout.endpoint), 0o755), ...[layout.hook_path, layout.worker_path, path.join(layout.managed_dir, "requirements.toml"), layout.release_root_public_key_path, layout.release_manifest_path, layout.release_signature_path, layout.service_config_path].map((file) => chmod(file, 0o644))]);
-  const service = spawn(layout.helper_path, ["serve", "--config", layout.service_config_path], { stdio: ["ignore", "ignore", "inherit"] });
+  await chown(path.dirname(layout.endpoint), 0, identity.gid); await chmod(path.dirname(layout.endpoint), 0o2770);
+  const service = spawn(layout.helper_path, ["serve", "--config", layout.service_config_path], { stdio: ["ignore", "ignore", "inherit"], uid: 0, gid: identity.gid });
   await waitFor(layout.attestation_public_key_path, service);
   const ready = { schema_version: "ty-context-managed-host-test-ready-v1", codex_launcher: codexLauncher, codex_script: codexScript, hook_path: layout.hook_path };
   await writeFile(readyPath, canonical(ready));
@@ -85,24 +52,20 @@ async function startLinuxManagedHost(candidate, source) {
 }
 
 async function startWindowsManagedHost(candidate, source) {
-  const moduleAt = (relative) => import(pathToFileURL(path.join(candidate, ...relative.split("/"))).href);
-  const [{ managedHostLayout }, release, { LONG_TASK_HOST_RELEASE_ROOT_PUBLIC_KEY_PEM }, installer] = await Promise.all([
-    moduleAt("dist/lib/long-task-managed-host-layout.js"),
-    moduleAt("dist/lib/long-task-host-release.js"),
-    moduleAt("dist/lib/long-task-host-release-root.js"),
-    moduleAt("dist/lib/long-task-host-installer.js")
-  ]);
-  const layout = managedHostLayout("win32");
-  await release.verifyHostReleaseDirectoryV1(source, LONG_TASK_HOST_RELEASE_ROOT_PUBLIC_KEY_PEM, { platform: "windows", arch: process.arch });
+  const layout = hostLayout("windows");
   const root = await mkdtemp(path.join(os.tmpdir(), "tyc-external-audit-host-"));
   const codexLauncher = path.join(root, "ty-context-external-audit-codex-launcher.exe");
   const codexScript = path.join(root, "ty-context-external-audit-codex-launcher.mjs");
-  await cp(process.execPath, codexLauncher);
+  await trusted("sc.exe", ["stop", "TyContextHostGate"], true); await trusted("sc.exe", ["delete", "TyContextHostGate"], true);
+  await Promise.all([rm(layout.managed_dir, { recursive: true, force: true }), rm(layout.state_root, { recursive: true, force: true }), rm(layout.requirements_file, { force: true }), mkdir(layout.managed_dir, { recursive: true }), mkdir(layout.state_root, { recursive: true }), mkdir(path.dirname(layout.requirements_file), { recursive: true })]);
+  await copyHostRelease(source, layout); await cp(process.execPath, codexLauncher);
   await writeFile(codexScript, `import {spawnSync} from "node:child_process";const result=spawnSync(process.argv[2],process.argv.slice(3),{stdio:"inherit",windowsHide:true});process.exit(result.status??1);\n`);
-  const cliPath = await realpath(path.join(candidate, "dist", "cli.js"));
-  const cliWorkerPath = await realpath(path.join(candidate, "dist", "lib", "long-task-host-worker-runtime.js"));
+  const requirements = renderHostRequirements(layout, await realpath(process.execPath)); await writeFile(layout.requirements_file, requirements); await writeHostConfig(candidate, layout, codexLauncher, requirements, "windows");
+  await secureWindows(layout, root);
+  const command = `"${layout.helper_path}" service --config "${layout.service_config_path}" --service-name "TyContextHostGate"`;
   try {
-    await installer.installManagedHostReleaseV1({ source, layout, cli_path: cliPath, cli_worker_path: cliWorkerPath, codex_launcher_path: codexLauncher, start_service: true });
+    await trusted("sc.exe", ["create", "TyContextHostGate", "binPath=", command, "start=", "auto", "obj=", "LocalSystem", "DisplayName=", "Tiny Context Managed Completion Gate"]);
+    await trusted("sc.exe", ["sidtype", "TyContextHostGate", "unrestricted"]); await trusted("sc.exe", ["start", "TyContextHostGate"]);
     await waitFor(layout.attestation_public_key_path);
   } catch (error) {
     await rm(root, { recursive: true, force: true });
@@ -112,8 +75,8 @@ async function startWindowsManagedHost(candidate, source) {
   return {
     ready,
     async close() {
-      await installer.uninstallManagedHostReleaseV1({ layout }).catch(() => undefined);
-      await rm(root, { recursive: true, force: true });
+      await trusted("sc.exe", ["stop", "TyContextHostGate"], true); await trusted("sc.exe", ["delete", "TyContextHostGate"], true);
+      await Promise.all([rm(root, { recursive: true, force: true }), rm(layout.managed_dir, { recursive: true, force: true }), rm(layout.state_root, { recursive: true, force: true }), rm(layout.requirements_file, { force: true })]);
     }
   };
 }
@@ -157,11 +120,8 @@ export async function verifyHostReleaseCandidateBinding(root, options) {
     ["ty-context-host-worker.mjs", path.join(candidate, ".codex", "ty-context-managed", "managed-host-gate", "ty-context-host-worker.mjs")]
   ]) await equalHostFile(path.join(root, releaseName), candidateFile, releaseName);
   for (const name of ["long-task-hook.mjs", "ty-context-host-worker.mjs"]) await equalHostFile(path.join(root, name), path.join(candidate, "packages", "ty-context", "assets", "managed-host-gate", name), `packaged-${name}`);
-  const moduleAt = (relative) => import(pathToFileURL(path.join(candidate, ...relative.split("/"))).href);
-  const [{ managedHostLayout }, { renderManagedRequirementsV1 }] = await Promise.all([moduleAt("packages/ty-context/dist/lib/long-task-managed-host-layout.js"), moduleAt("packages/ty-context/dist/lib/long-task-managed-requirements.js")]);
-  const nodePlatform = options.platform === "windows" ? "win32" : options.platform === "macos" ? "darwin" : "linux";
   const nodePath = options.platform === "windows" ? "C:\\Program Files\\nodejs\\node.exe" : options.platform === "macos" && options.arch === "arm64" ? "/opt/homebrew/bin/node" : options.platform === "macos" ? "/usr/local/bin/node" : "/usr/bin/node";
-  const layout = managedHostLayout(nodePlatform); const expected = renderManagedRequirementsV1({ ...layout, node_path: nodePath, unix_node_path: options.platform === "windows" ? "/usr/bin/node" : nodePath });
+  const layout = hostLayout(options.platform); const expected = renderHostRequirements(layout, nodePath);
   if ((await readFile(path.join(root, "requirements.toml"), "utf8")) !== expected) hostFail("host_release_candidate_binding_mismatch:requirements.toml");
 }
 
@@ -172,7 +132,7 @@ async function verifyHostDirectory(root, expected) {
   if (!Buffer.from(installed).equals(Buffer.from(pinned))) hostFail("host_release_root_key_mismatch");
   const manifestText = await readFile(path.join(root, "host-release-manifest.json"), "utf8"); let manifest; try { manifest = JSON.parse(manifestText); } catch { hostFail("host_release_manifest_invalid"); }
   hostExact(manifest, ["arch", "files", "platform", "protocol", "release_version", "schema_version"], "manifest");
-  if (canonical(manifest) !== manifestText || manifest.schema_version !== "ty-context-host-release-v1" || manifest.release_version !== "0.4.0" || manifest.protocol !== "ty-context-host-rpc-v1" || manifest.platform !== expected.platform || manifest.arch !== expected.arch) hostFail("host_release_manifest_invalid");
+  if (`${JSON.stringify(manifest, null, 2)}\n` !== manifestText || manifest.schema_version !== "ty-context-host-release-v1" || manifest.release_version !== "0.4.0" || manifest.protocol !== "ty-context-host-rpc-v1" || manifest.platform !== expected.platform || manifest.arch !== expected.arch) hostFail("host_release_manifest_invalid");
   const signature = Buffer.from((await readFile(path.join(root, "host-release-manifest.sig"), "utf8")).trim(), "base64url");
   if (!verify(null, Buffer.from(manifestText), HOST_RELEASE_ROOT_PUBLIC_KEY_PEM, signature)) hostFail("host_release_signature_invalid");
   if (!Array.isArray(manifest.files) || manifest.files.length > 64) hostFail("host_release_manifest_files_invalid");
@@ -219,3 +179,71 @@ function hostZero(bytes) { return bytes.every((byte) => byte === 0); }
 function hostExact(value, keys, label) { if (!value || typeof value !== "object" || Array.isArray(value) || canonical(Object.keys(value).sort()) !== canonical([...keys].sort())) hostFail(`host_release_${label}_keys_invalid`); }
 async function equalHostFile(left, right, label) { if (sha256(await readFile(left)) !== sha256(await readFile(await realpath(right)))) hostFail(`host_release_candidate_binding_mismatch:${label}`); }
 function hostFail(code) { throw new Error(code); }
+
+function hostLayout(platform) {
+  const windows = platform === "windows"; const mac = platform === "macos"; const managed = windows ? "C:\\Program Files\\OpenAI\\Codex\\ManagedHooks\\ty-context" : mac ? "/Library/Application Support/OpenAI/Codex/ManagedHooks/ty-context" : "/opt/openai/codex/managed-hooks/ty-context"; const state = windows ? "C:\\ProgramData\\OpenAI\\Codex\\ty-context-host" : mac ? "/Library/Application Support/OpenAI/Codex/ty-context-host" : "/var/lib/ty-context"; const suffix = windows ? ".exe" : "";
+  return { platform, requirements_file: windows ? "C:\\ProgramData\\OpenAI\\Codex\\requirements.toml" : "/etc/codex/requirements.toml", managed_dir: managed, unix_managed_dir: windows ? "/opt/openai/codex/managed-hooks/ty-context" : managed, windows_managed_dir: windows ? managed : "C:\\Program Files\\OpenAI\\Codex\\ManagedHooks\\ty-context", state_root: state, endpoint: windows ? "\\\\.\\pipe\\ty-context-host-gate-v1" : mac ? "/var/run/ty-context/host-gate.sock" : "/run/ty-context/host-gate.sock", helper_path: path.join(managed, `ty-context-host-helper${suffix}`), admin_path: path.join(managed, `ty-context-host-admin${suffix}`), installer_ui_path: path.join(managed, `ty-context-host-installer-ui${suffix}`), hook_path: path.join(managed, "long-task-hook.mjs"), worker_path: path.join(managed, "ty-context-host-worker.mjs"), release_manifest_path: path.join(managed, "host-release-manifest.json"), release_signature_path: path.join(managed, "host-release-manifest.sig"), release_root_public_key_path: path.join(managed, "host-release-root-public.pem"), attestation_public_key_path: path.join(managed, "host-service-public.pem"), service_config_path: path.join(managed, "host-service-config.json") };
+}
+
+function renderHostRequirements(layout, nodePath) {
+  const unixNode = layout.platform === "windows" ? "/usr/bin/node" : nodePath; const unixHook = `${layout.unix_managed_dir.replace(/\\/gu, "/")}/long-task-hook.mjs`; const windowsHook = path.win32.join(layout.windows_managed_dir, "long-task-hook.mjs"); const shell = (value) => `"${value.replace(/(["\\$`])/gu, "\\$1")}"`; const literal = (value) => `'${value}'`;
+  return `# ty-context-host-gate:managed:begin
+allow_managed_hooks_only = true
+
+[features]
+hooks = true
+
+[hooks]
+managed_dir = ${JSON.stringify(layout.unix_managed_dir)}
+windows_managed_dir = ${literal(layout.windows_managed_dir)}
+
+[[hooks.SessionStart]]
+matcher = "^(startup|resume|clear|compact)$"
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = ${JSON.stringify(`${shell(unixNode)} ${shell(unixHook)}`)}
+command_windows = ${literal(`"${nodePath.replace(/"/gu, '\\"')}" "${windowsHook.replace(/"/gu, '\\"')}"`)}
+timeout = 10
+statusMessage = "Restoring the sealed composite task"
+
+[[hooks.PostCompact]]
+matcher = "^(manual|auto)$"
+[[hooks.PostCompact.hooks]]
+type = "command"
+command = ${JSON.stringify(`${shell(unixNode)} ${shell(unixHook)}`)}
+command_windows = ${literal(`"${nodePath.replace(/"/gu, '\\"')}" "${windowsHook.replace(/"/gu, '\\"')}"`)}
+timeout = 10
+statusMessage = "Restoring the sealed composite task"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = ${JSON.stringify(`${shell(unixNode)} ${shell(unixHook)}`)}
+command_windows = ${literal(`"${nodePath.replace(/"/gu, '\\"')}" "${windowsHook.replace(/"/gu, '\\"')}"`)}
+timeout = 21600
+statusMessage = "Running sealed final acceptance"
+# ty-context-host-gate:managed:end
+`;
+}
+
+async function copyHostRelease(source, layout) {
+  const suffix = layout.platform === "windows" ? ".exe" : ""; await Promise.all([["requirements.toml", path.join(layout.managed_dir, "requirements.toml")], ["long-task-hook.mjs", layout.hook_path], ["ty-context-host-worker.mjs", layout.worker_path], [`ty-context-host-helper${suffix}`, layout.helper_path], [`ty-context-host-admin${suffix}`, layout.admin_path], [`ty-context-host-installer-ui${suffix}`, layout.installer_ui_path], ["host-release-manifest.json", layout.release_manifest_path], ["host-release-manifest.sig", layout.release_signature_path], ["host-release-root-public.pem", layout.release_root_public_key_path]].map(([name, target]) => cp(path.join(source, name), target)));
+}
+
+async function writeHostConfig(candidate, layout, codexLauncher, requirements, platform) {
+  for (const directory of ["keys", "registry/active", "registry/tombstones", "journal", "bundles", "dependencies", "browsers", "staging", "quarantine", "audit", "repositories"]) await mkdir(path.join(layout.state_root, directory), { recursive: true });
+  const nodePath = await realpath(process.execPath); const cliPath = await realpath(path.join(candidate, "dist", "cli.js")); const workerPath = await realpath(path.join(candidate, "dist", "lib", "long-task-host-worker-runtime.js")); const runtime = await runtimeManifest(cliPath, candidate); const sandbox = platform === "windows" ? layout.helper_path : await firstReal(["/usr/bin/bwrap", "/bin/bwrap"]);
+  const hash = async (file) => sha256(await readFile(file)); const config = { schema_version: "ty-context-host-service-config-v1", state_root: layout.state_root, endpoint: layout.endpoint, managed_dir: layout.managed_dir, requirements_file: layout.requirements_file, node_path: nodePath, node_sha256: await hash(nodePath), helper_path: layout.helper_path, sandbox_launcher_path: sandbox, sandbox_launcher_sha256: await hash(sandbox), admin_path: layout.admin_path, admin_sha256: await hash(layout.admin_path), installer_ui_path: layout.installer_ui_path, installer_ui_sha256: await hash(layout.installer_ui_path), codex_launcher_path: codexLauncher, codex_launcher_sha256: await hash(codexLauncher), cli_path: cliPath, cli_sha256: await hash(cliPath), cli_worker_path: workerPath, cli_worker_sha256: await hash(workerPath), cli_runtime_manifest: runtime, cli_runtime_manifest_sha256: sha256(canonical(runtime)), hook_path: layout.hook_path, hook_sha256: await hash(layout.hook_path), worker_path: layout.worker_path, worker_sha256: await hash(layout.worker_path), attestation_public_key_path: layout.attestation_public_key_path, managed_policy_sha256: sha256(requirements), release_manifest_sha256: await hash(layout.release_manifest_path), test_namespace: false };
+  await writeFile(layout.service_config_path, canonical(config));
+}
+
+async function runtimeManifest(cliPath, candidate) {
+  const names = ["yaml", "re2js", "esbuild", `@esbuild/${process.platform === "win32" ? "win32" : process.platform}-${process.arch}`]; const roots = [await realpath(path.dirname(cliPath))]; for (const name of names) roots.push(await dependencyRoot(candidate, name)); const files = new Map(); for (const root of roots.sort()) await collectRuntime(root, files); const result = { schema_version: "ty-context-host-cli-runtime-manifest-v1", files: [...files.values()].sort((a, b) => normalized(a.path).localeCompare(normalized(b.path))) }; if (!result.files.length || result.files.length > 20000 || result.files.reduce((sum, item) => sum + item.size, 0) > 512 * 1024 * 1024) hostFail("host_runtime_manifest_limits"); return result;
+}
+async function dependencyRoot(candidate, name) { const parts = name.split("/"); for (const base of [path.join(candidate, "node_modules"), path.dirname(candidate)]) { const root = path.join(base, ...parts); try { const value = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")); if (value.name === name) return realpath(root); } catch {} } hostFail(`host_runtime_package_root_missing:${name}`); }
+async function collectRuntime(root, files) { for (const entry of (await readdir(root, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) { const file = path.join(root, entry.name); const info = await lstat(file); if (info.isSymbolicLink()) hostFail(`host_runtime_symlink_forbidden:${file}`); if (entry.isDirectory()) await collectRuntime(file, files); else if (entry.isFile() && (/.(?:c?js|mjs|json|node|wasm|exe)$/iu.test(entry.name) || !entry.name.includes("."))) { const resolved = await realpath(file); const bytes = await readFile(resolved); files.set(normalized(resolved), { path: resolved, sha256: sha256(bytes), size: bytes.length }); } } }
+function normalized(value) { const result = path.resolve(value).replace(/^\\\\\?\\/u, ""); return process.platform === "win32" ? result.toLocaleLowerCase("en-US") : result; }
+async function firstReal(files) { for (const file of files) try { const resolved = await realpath(file); if ((await lstat(resolved)).isFile()) return resolved; } catch {} hostFail("sandbox_capability_unavailable:bubblewrap_missing"); }
+function linuxCandidateIdentity() { const uid = Number(process.env.TY_CONTEXT_AUDIT_CANDIDATE_UID ?? process.env.SUDO_UID); const gid = Number(process.env.TY_CONTEXT_AUDIT_CANDIDATE_GID ?? process.env.SUDO_GID); if (!Number.isInteger(uid) || uid <= 0 || !Number.isInteger(gid) || gid <= 0) hostFail("external_audit_candidate_identity_required"); return { uid, gid }; }
+async function secureWindows(layout, runtimeRoot) { await trusted("icacls.exe", [layout.managed_dir, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/T", "/C"]); await trusted("icacls.exe", [layout.state_root, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C"]); await trusted("icacls.exe", [layout.requirements_file, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-5-32-545:R"]); await trusted("icacls.exe", [runtimeRoot, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/T", "/C"]); }
+function trusted(file, args, allowFailure = false) { return new Promise((resolve, reject) => { const child = spawn(file, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); const stderr = []; child.stderr.on("data", (value) => stderr.push(value)); child.once("error", allowFailure ? resolve : reject); child.once("exit", (code) => code === 0 || allowFailure ? resolve() : reject(new Error(`trusted_command_failed:${path.basename(file)}:${Buffer.concat(stderr).toString("utf8")}`))); }); }

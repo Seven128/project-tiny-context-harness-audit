@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { installCandidate, runProcess, safeCode, sha256 } from "./candidate-installer.mjs";
+import { grantCandidateTree, installCandidate, runProcess, safeCode, sha256 } from "./candidate-installer.mjs";
 import { invokeManagedHook } from "./managed-hook-driver.mjs";
 
 const exec = promisify(execFile);
@@ -22,6 +22,7 @@ export async function runAttackMatrix({ tarball, candidateSha256, ready, expecte
 
 export async function createAuditRuntime(row, options, settings = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), `tyc-external-${row.id}-`));
+  if (process.platform !== "win32") await chmod(root, 0o711);
   const repository = path.join(root, "project"); const install = path.join(root, "candidate");
   const candidate = await installCandidate(install, options.tarball, options.candidateSha256);
   const workdir = await writeBaseContract(repository, settings);
@@ -51,6 +52,7 @@ async function writeBaseContract(repository, settings) {
   await Promise.all([writeFile(path.join(task, "product-architecture-source.yaml"), `${JSON.stringify(data.product, null, 2)}\n`), writeFile(path.join(task, "technical-realization-plan.yaml"), `${JSON.stringify(data.plan, null, 2)}\n`), writeFile(path.join(task, "acceptance-checklist.yaml"), `${JSON.stringify(data.checklist, null, 2)}\n`)]);
   if (settings.prepare) await settings.prepare(repository, task);
   await exec("git", ["init", "--quiet"], { cwd: repository }); await exec("git", ["config", "user.email", "external-audit@example.invalid"], { cwd: repository }); await exec("git", ["config", "user.name", "External Audit"], { cwd: repository }); await exec("git", ["add", "-A"], { cwd: repository }); await exec("git", ["commit", "--quiet", "-m", "external audit fixture"], { cwd: repository });
+  await grantCandidateTree(repository);
   return task;
 }
 

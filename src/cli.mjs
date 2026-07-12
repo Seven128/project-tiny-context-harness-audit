@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { createPrivateKey, createPublicKey, sign } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAttackMatrix } from "./black-box-runner.mjs";
-import { canonical, installCandidate, sha256, sha256File } from "./candidate-installer.mjs";
+import { canonical, grantCandidateTree, installCandidate, prepareCandidateHome, runProcess, sealCandidateTree, secureAuditRoot, sha256, sha256File } from "./candidate-installer.mjs";
 import { runConsumerLab } from "./consumer-lab.mjs";
 import { acquireManagedHost, assertHostReleasePolicy, materializeVerifiedHostRelease, verifyHostReleaseCandidateBinding } from "./managed-hook-driver.mjs";
 
@@ -25,24 +25,42 @@ if (option("--verify-host-release-candidate")) {
   process.exit(0);
 }
 
+if (option("--bind-candidate-artifact")) {
+  assertCandidateController();
+  await bindCandidateArtifact();
+  process.exit(0);
+}
+
+if (option("--build-host-candidate")) {
+  assertCandidateController();
+  await buildHostCandidate();
+  process.exit(0);
+}
+
 if (option("--resign-result")) {
   await resignResult();
   process.exit(0);
 }
 
-const candidateTarball = path.resolve(requiredOption("--candidate"));
+const candidateSourceTarball = path.resolve(requiredOption("--candidate"));
+assertCandidateController();
 const candidateSha256 = requiredOption("--candidate-sha256");
 const auditIntegrity = requiredOption("--audit-integrity");
-const resultPath = path.resolve(requiredOption("--result"));
+const requestedResultPath = path.resolve(requiredOption("--result"));
 const signingKeyPath = path.resolve(requiredOption("--signing-key"));
 const expectedKeyId = requiredOption("--signing-key-id");
 const hostReleaseArchive = path.resolve(requiredOption("--host-release"));
 const hostReleaseSha256 = requiredOption("--host-release-sha256");
 const diagnosticFilter = process.env.TY_CONTEXT_AUDIT_FILTER;
 if (!/^[a-f0-9]{64}$/u.test(candidateSha256) || !/^sha512-[A-Za-z0-9+/]+={0,2}$/u.test(auditIntegrity)) throw new Error("external_audit_identity_argument_invalid");
-if (await sha256File(candidateTarball) !== candidateSha256) throw new Error("candidate_sha256_mismatch");
+if (await sha256File(candidateSourceTarball) !== candidateSha256) throw new Error("candidate_sha256_mismatch");
 
 const root = await mkdtemp(path.join(os.tmpdir(), "tyc-external-audit-"));
+await secureAuditRoot(root);
+const candidateTarball = path.join(root, "candidate.tgz"); await copyFile(candidateSourceTarball, candidateTarball);
+const resultPath = path.join(root, "provisional-result.json");
+const candidateHome = await prepareCandidateHome(path.join(root, "candidate-home"));
+process.env.HOME = candidateHome; process.env.USERPROFILE = candidateHome; process.env.NPM_CONFIG_CACHE = path.join(candidateHome, ".npm");
 let host;
 let hostRelease;
 let failed = false;
@@ -76,7 +94,8 @@ try {
   const envelope = { schema_version: "external-audit-result-v1", payload, signature: { algorithm: "Ed25519", key_id: keyId, value: sign(null, Buffer.from(canonical(payload)), privateKey).toString("base64url") } };
   await mkdir(path.dirname(resultPath), { recursive: true });
   await writeFile(resultPath, `${canonical(envelope)}\n`, { flag: "wx" });
-  process.stdout.write(`external_audit_result=${resultPath}\n`);
+  await mkdir(path.dirname(requestedResultPath), { recursive: true }); await copyFile(resultPath, requestedResultPath, 1);
+  process.stdout.write(`external_audit_result=${requestedResultPath}\n`);
 } finally {
   await host?.close();
   await hostRelease?.close();
@@ -92,9 +111,11 @@ async function assertSelf() {
   const sources = (await readdir(path.join(packageRoot, "src"))).sort();
   if (canonical(sources) !== canonical(["black-box-runner.mjs", "candidate-installer.mjs", "cli.mjs", "consumer-lab.mjs", "managed-hook-driver.mjs"].sort())) throw new Error("external_audit_source_surface_invalid");
   const driver = await readFile(path.join(packageRoot, "src", "managed-hook-driver.mjs"), "utf8");
-  if (/HOST_RELEASE_ROOT_PRIVATE_KEY|host-release-root-private/u.test(driver)) throw new Error("external_audit_host_root_private_key_surface_forbidden");
+  const installer = await readFile(path.join(packageRoot, "src", "candidate-installer.mjs"), "utf8");
+  if (/HOST_RELEASE_ROOT_PRIVATE_KEY|host-release-root-private|moduleAt\(|pathToFileURL/u.test(driver) || !driver.includes("linuxCandidateIdentity") || !driver.includes("runtimeManifest")) throw new Error("external_audit_privileged_host_boundary_invalid");
+  if (!installer.includes("candidateEnvironment") || !installer.includes("runWindowsCandidate") || !installer.includes("uid: identity.uid") || !installer.includes("terminateCandidateProcesses") || !installer.includes("sealCandidateTree")) throw new Error("external_audit_unprivileged_candidate_boundary_invalid");
   const workflow = await readFile(path.join(packageRoot, ".github", "workflows", "audit-candidate.yml"), "utf8").catch(() => "");
-  if (workflow && (!workflow.includes("linux_host_release_url") || !workflow.includes("--host-release-sha256") || /HOST_RELEASE_ROOT_PRIVATE_KEY|host-release-root-private/u.test(workflow))) throw new Error("external_audit_workflow_host_release_boundary_invalid");
+  if (workflow && (!workflow.includes("linux_host_release_url") || !workflow.includes("--host-release-sha256") || !workflow.includes("unprivileged candidate identity") || !workflow.includes("--npm-cli") || !workflow.includes("--cargo-bin") || !workflow.includes("TY_CONTEXT_AUDIT_CARGO_BIN") || !workflow.includes("x86_64-pc-windows-gnullvm") || !workflow.includes("Remove temporary Windows candidate identity") || /HOST_RELEASE_ROOT_PRIVATE_KEY|host-release-root-private/u.test(workflow))) throw new Error("external_audit_workflow_host_release_boundary_invalid");
 }
 async function verifyHostReleaseCandidate() {
   const hostRelease = await materializeVerifiedHostRelease({
@@ -114,6 +135,20 @@ async function verifyHostReleaseCandidate() {
     });
     process.stdout.write(`host_release_candidate_binding=passed sha256=${hostRelease.identity.sha256}\n`);
   } finally { await hostRelease.close(); }
+}
+async function bindCandidateArtifact() {
+  const source = path.resolve(requiredOption("--candidate-source")); const candidate = path.resolve(requiredOption("--bind-candidate-artifact")); const expectedSha256 = requiredOption("--candidate-sha256"); const output = path.resolve(requiredOption("--output-dir")); const npmCli = await realFileOption("--npm-cli");
+  if (!/^[a-f0-9]{64}$/u.test(expectedSha256) || await sha256File(candidate) !== expectedSha256) throw new Error("candidate_sha256_mismatch");
+  await grantCandidateTree(source); await mkdir(output, { recursive: true }); await grantCandidateTree(output); const home = await prepareCandidateHome(path.join(output, ".candidate-home")); const childEnv = { ...process.env, HOME: home, USERPROFILE: home, NPM_CONFIG_CACHE: path.join(home, ".npm") };
+  try { for (const [args, timeout] of [[["ci", "--ignore-scripts"], 10 * 60_000], [["run", "build", "--workspace", "project-tiny-context-harness"], 10 * 60_000], [["pack", "--silent", "--ignore-scripts", "--workspace", "project-tiny-context-harness", "--pack-destination", output], 10 * 60_000]]) { const result = await runProcess(process.execPath, [npmCli, ...args], { cwd: source, env: childEnv, timeoutMs: timeout }); if (result.status !== 0) throw new Error(`candidate_rebuild_failed:${result.stderr}`); } } finally { await sealCandidateTree(source); await sealCandidateTree(output); }
+  const archives = (await readdir(output)).filter((name) => name.endsWith(".tgz")); if (archives.length !== 1) throw new Error("candidate_rebuild_archive_invalid");
+  const rebuiltSha256 = await sha256File(path.join(output, archives[0])); if (rebuiltSha256 !== expectedSha256) throw new Error("candidate_tarball_does_not_match_commit");
+  process.stdout.write(`candidate_commit_binding=passed sha256=${rebuiltSha256}\n`);
+}
+async function buildHostCandidate() {
+  const source = path.resolve(requiredOption("--build-host-candidate")); const cargoBin = await realFileOption("--cargo-bin"); const target = requiredOption("--target"); const wanted = process.platform === "win32" ? "x86_64-pc-windows-gnullvm" : process.platform === "linux" ? "x86_64-unknown-linux-gnu" : ""; if (target !== wanted) throw new Error("candidate_host_target_invalid"); await grantCandidateTree(source); const home = await prepareCandidateHome(path.join(source, ".tyc-audit-build-home")); const childEnv = { ...process.env, HOME: home, USERPROFILE: home };
+  const manifestPath = path.join(source, "host", "ty-context-host-helper", "Cargo.toml"); let result; try { result = await runProcess(cargoBin, ["build", "--release", "--locked", "--target", target, "--manifest-path", manifestPath], { cwd: source, env: childEnv, timeoutMs: 20 * 60_000 }); } finally { await sealCandidateTree(source); }
+  if (result.status !== 0) throw new Error(`candidate_host_build_failed:${result.stderr}`); process.stdout.write("candidate_host_build=passed\n");
 }
 async function resignResult() {
   const inputPath = path.resolve(requiredOption("--resign-result"));
@@ -158,7 +193,9 @@ function validatePassingFullPayload(payload, auditIntegrity, candidateSha256, ho
 }
 function option(name) { const index = process.argv.indexOf(name); return index < 0 ? undefined : process.argv[index + 1]; }
 function requiredOption(name) { const value = option(name); if (!value) throw new Error(`missing_${name.slice(2).replace(/-/gu, "_")}`); return value; }
+async function realFileOption(name) { const file = await realpath(path.resolve(requiredOption(name))); if (!(await stat(file)).isFile()) throw new Error(`invalid_${name.slice(2).replace(/-/gu, "_")}`); return file; }
 function platformName(value = process.platform) { if (value === "win32") return "windows"; if (value === "darwin") return "macos"; if (value === "linux" || value === "windows" || value === "macos") return value; throw new Error("external_audit_platform_unsupported"); }
 function exact(value, keys, label) { if (!value || typeof value !== "object" || Array.isArray(value) || canonical(Object.keys(value).sort()) !== canonical([...keys].sort())) throw new Error(`external_audit_${label}_keys_invalid`); }
 function hex(value) { return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value); }
 function nonnegative(value) { return Number.isInteger(value) && value >= 0; }
+function assertCandidateController() { if (process.platform === "win32") { if (!process.env.TY_CONTEXT_AUDIT_WINDOWS_USER || !process.env.TY_CONTEXT_AUDIT_WINDOWS_PASSWORD) throw new Error("external_audit_windows_candidate_identity_required"); return; } if (process.platform !== "linux" || process.getuid?.() !== 0) throw new Error("external_audit_privileged_controller_required"); const uid = Number(process.env.TY_CONTEXT_AUDIT_CANDIDATE_UID); const gid = Number(process.env.TY_CONTEXT_AUDIT_CANDIDATE_GID); if (!Number.isInteger(uid) || uid <= 0 || !Number.isInteger(gid) || gid <= 0) throw new Error("external_audit_candidate_identity_required"); }
