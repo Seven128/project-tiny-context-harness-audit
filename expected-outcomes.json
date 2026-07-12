@@ -1,0 +1,21 @@
+{
+  "schema_version": "external-audit-expected-outcomes-v1",
+  "attacks": [
+    {"id":"v2_source_rejected","expected_status":"compile_rejected","expected_code":"source_schema_unsupported"},
+    {"id":"constant_success_missing_implementation","expected_status":"needs_work","expected_code":"binding_target_missing"},
+    {"id":"oracle_self_signed_passed","expected_status":"needs_work","expected_code":"oracle_self_signed_result"},
+    {"id":"command_target_drift","expected_status":"needs_work","expected_code":"verifier_changed"},
+    {"id":"host_authority_survives_pointer_deletion","expected_status":"accepted","expected_code":"ok"},
+    {"id":"forged_final_result_rejected","expected_status":"blocked","expected_code":"final_result_hash_mismatch"},
+    {"id":"no_active_hook_noop","expected_status":"noop","expected_code":"ok"},
+    {"id":"happy_path","expected_status":"accepted","expected_code":"ok"}
+  ],
+  "consumers": [
+    {"id":"npm_dependency_import","expected_status":"accepted"},
+    {"id":"npm_workspaces","expected_status":"accepted"},
+    {"id":"vitest","expected_status":"accepted"},
+    {"id":"jest","expected_status":"accepted"},
+    {"id":"playwright","expected_status":"accepted"},
+    {"id":"built_artifact","expected_status":"accepted"}
+  ]
+}

@@ -1,0 +1,217 @@
+name: audit-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_url:
+        description: Immutable candidate tarball URL
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact candidate SHA-256
+        required: true
+        type: string
+      candidate_commit:
+        description: Main-repository commit receiving the required check
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: audit-${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            binary_suffix: ""
+          - os: windows-2025
+            platform: windows
+            binary_suffix: .exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout protected audit source
+        uses: actions/checkout@v4
+      - name: Checkout exact candidate source without credentials
+        uses: actions/checkout@v4
+        with:
+          repository: Seven128/project-tiny-context-harness
+          ref: ${{ inputs.candidate_commit }}
+          path: candidate-source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Select declared Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+      - name: Install audit dependencies and verify release package identity
+        shell: pwsh
+        env:
+          EXPECTED_AUDIT_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
+        run: |
+          npm ci --ignore-scripts
+          npm run self-test
+          $packRoot = Join-Path $env:RUNNER_TEMP "audit-pack"
+          $installRoot = Join-Path $env:RUNNER_TEMP "audit-install"
+          New-Item -ItemType Directory -Force $packRoot, $installRoot | Out-Null
+          $name = npm pack --silent --pack-destination $packRoot
+          $tarball = Join-Path $packRoot $name.Trim()
+          node -e "const fs=require('node:fs'),c=require('node:crypto');const sri='sha512-'+c.createHash('sha512').update(fs.readFileSync(process.argv[1])).digest('base64');if(sri!==process.argv[2])throw new Error('audit package integrity mismatch');" $tarball $env:EXPECTED_AUDIT_INTEGRITY
+          Set-Content -Encoding utf8NoBOM (Join-Path $installRoot "package.json") '{"private":true}'
+          npm install --prefix $installRoot --ignore-scripts --no-audit --no-fund --package-lock=false $tarball
+          "AUDIT_CLI=$(Join-Path $installRoot 'node_modules/project-tiny-context-harness-audit/src/cli.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Download and bind candidate tarball to the checked commit
+        shell: pwsh
+        env:
+          CANDIDATE_URL: ${{ inputs.candidate_url }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+        run: |
+          $candidate = Join-Path $env:RUNNER_TEMP "candidate.tgz"
+          node -e "const fs=require('node:fs');fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error('candidate download '+r.status);return r.arrayBuffer()}).then(b=>fs.writeFileSync(process.argv[2],Buffer.from(b)))" $env:CANDIDATE_URL $candidate
+          node -e "const fs=require('node:fs'),c=require('node:crypto');const actual=c.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex');if(actual!==process.argv[2])throw new Error('candidate sha256 mismatch');" $candidate $env:CANDIDATE_SHA256
+          npm ci --prefix candidate-source --ignore-scripts
+          npm run build --prefix candidate-source --workspace project-tiny-context-harness
+          $repack = Join-Path $env:RUNNER_TEMP "candidate-repack"
+          New-Item -ItemType Directory -Force $repack | Out-Null
+          $name = npm pack --silent --prefix candidate-source --workspace project-tiny-context-harness --ignore-scripts --pack-destination $repack
+          $rebuilt = Join-Path $repack $name.Trim()
+          node -e "const fs=require('node:fs'),c=require('node:crypto');for(const p of process.argv.slice(1)){console.log(c.createHash('sha256').update(fs.readFileSync(p)).digest('hex'))}" $candidate $rebuilt | Tee-Object -Variable hashes
+          if ($hashes[0] -ne $hashes[1] -or $hashes[0] -ne $env:CANDIDATE_SHA256) { throw "candidate tarball does not match candidate commit" }
+          "CANDIDATE_TARBALL=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build candidate Host binaries before creating audit keys
+        shell: pwsh
+        run: |
+          cargo build --release --locked --manifest-path candidate-source/host/ty-context-host-helper/Cargo.toml
+          $release = Resolve-Path "candidate-source/host/ty-context-host-helper/target/release"
+          "TY_CONTEXT_HOST_HELPER_BIN=$(Join-Path $release 'ty-context-host-helper${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TY_CONTEXT_HOST_ADMIN_BIN=$(Join-Path $release 'ty-context-host-admin${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TY_CONTEXT_HOST_INSTALLER_UI_BIN=$(Join-Path $release 'ty-context-host-installer-ui${{ matrix.binary_suffix }}')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install Linux sandbox and browser system libraries
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo npx --yes playwright@1.61.1 install-deps chromium
+      - name: Generate per-job Host and provisional result keys
+        shell: pwsh
+        run: |
+          node -e "const fs=require('node:fs'),c=require('node:crypto'),p=require('node:path');for(const [stem,keyEnv,idEnv] of [['host','TY_CONTEXT_HOST_RELEASE_ROOT_PRIVATE_KEY','HOST_KEY_ID'],['provisional','PROVISIONAL_AUDIT_KEY','PROVISIONAL_AUDIT_KEY_ID']]){const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const file=p.join(process.env.RUNNER_TEMP,stem+'-private.pem');fs.writeFileSync(file,privateKey.export({type:'pkcs8',format:'pem'}));const id=c.createHash('sha256').update(publicKey.export({type:'spki',format:'der'})).digest('hex');fs.appendFileSync(process.env.GITHUB_ENV,keyEnv+'='+file+'\n'+idEnv+'='+id+'\n');}"
+      - name: Run exact installed audit package on Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
+        run: |
+          sudo --preserve-env=AUDIT_CLI,CANDIDATE_TARBALL,TY_CONTEXT_HOST_HELPER_BIN,TY_CONTEXT_HOST_ADMIN_BIN,TY_CONTEXT_HOST_INSTALLER_UI_BIN,TY_CONTEXT_HOST_RELEASE_ROOT_PRIVATE_KEY,PROVISIONAL_AUDIT_KEY,PROVISIONAL_AUDIT_KEY_ID,AUDIT_PACKAGE_INTEGRITY,GITHUB_ACTIONS node "$AUDIT_CLI" \
+            --candidate "$CANDIDATE_TARBALL" \
+            --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
+            --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
+            --signing-key "$PROVISIONAL_AUDIT_KEY" \
+            --signing-key-id "$PROVISIONAL_AUDIT_KEY_ID" \
+            --result "$RUNNER_TEMP/external-audit-result-${{ matrix.platform }}.json"
+      - name: Run exact installed audit package on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
+        run: |
+          node $env:AUDIT_CLI --candidate $env:CANDIDATE_TARBALL --candidate-sha256 "${{ inputs.candidate_sha256 }}" --audit-integrity $env:AUDIT_PACKAGE_INTEGRITY --signing-key $env:PROVISIONAL_AUDIT_KEY --signing-key-id $env:PROVISIONAL_AUDIT_KEY_ID --result (Join-Path $env:RUNNER_TEMP "external-audit-result-${{ matrix.platform }}.json")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-external-audit-result-${{ matrix.platform }}
+          path: ${{ runner.temp }}/external-audit-result-${{ matrix.platform }}.json
+          if-no-files-found: error
+
+  sign:
+    name: sign-independent-results
+    needs: audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-external-audit-result-*
+          path: ${{ runner.temp }}/raw
+          merge-multiple: true
+      - name: Install exact audit package
+        shell: bash
+        env:
+          EXPECTED_AUDIT_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
+        run: |
+          npm ci --ignore-scripts
+          npm run self-test
+          mkdir -p "$RUNNER_TEMP/audit-pack" "$RUNNER_TEMP/audit-install"
+          name=$(npm pack --silent --pack-destination "$RUNNER_TEMP/audit-pack")
+          tarball="$RUNNER_TEMP/audit-pack/$name"
+          node -e 'const fs=require("node:fs"),c=require("node:crypto");const sri="sha512-"+c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64");if(sri!==process.argv[2])throw new Error("audit package integrity mismatch")' "$tarball" "$EXPECTED_AUDIT_INTEGRITY"
+          printf '{"private":true}\n' > "$RUNNER_TEMP/audit-install/package.json"
+          npm install --prefix "$RUNNER_TEMP/audit-install" --ignore-scripts --no-audit --no-fund --package-lock=false "$tarball"
+          echo "AUDIT_CLI=$RUNNER_TEMP/audit-install/node_modules/project-tiny-context-harness-audit/src/cli.mjs" >> "$GITHUB_ENV"
+      - name: Materialize signer key outside candidate jobs
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TY_CONTEXT_EXTERNAL_AUDIT_SIGNING_KEY }}
+        run: |
+          node -e 'require("node:fs").writeFileSync(process.argv[1],process.env.SIGNING_KEY)' "$RUNNER_TEMP/external-audit-private.pem"
+          chmod 600 "$RUNNER_TEMP/external-audit-private.pem"
+      - name: Validate full results and apply durable signatures
+        shell: bash
+        env:
+          AUDIT_PACKAGE_INTEGRITY: ${{ vars.AUDIT_PACKAGE_INTEGRITY }}
+          AUDIT_SIGNING_KEY_ID: ${{ vars.AUDIT_SIGNING_KEY_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signed"
+          for platform in linux windows; do
+            node "$AUDIT_CLI" \
+              --resign-result "$RUNNER_TEMP/raw/external-audit-result-$platform.json" \
+              --candidate-sha256 "${{ inputs.candidate_sha256 }}" \
+              --audit-integrity "$AUDIT_PACKAGE_INTEGRITY" \
+              --signing-key "$RUNNER_TEMP/external-audit-private.pem" \
+              --signing-key-id "$AUDIT_SIGNING_KEY_ID" \
+              --result "$RUNNER_TEMP/signed/external-audit-result-$platform.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-external-audit-results
+          path: ${{ runner.temp }}/signed/*.json
+          if-no-files-found: error
+
+  report:
+    name: external-long-task-audit
+    needs: sign
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mint restricted check token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.EXTERNAL_AUDIT_APP_ID }}
+          private-key: ${{ secrets.EXTERNAL_AUDIT_APP_PRIVATE_KEY }}
+          owner: Seven128
+          repositories: project-tiny-context-harness
+      - name: Post exact-commit required check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST repos/Seven128/project-tiny-context-harness/check-runs \
+            -f name=external-long-task-audit \
+            -f head_sha='${{ inputs.candidate_commit }}' \
+            -f status=completed \
+            -f conclusion=success \
+            -f details_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' \
+            -f 'output[title]=Independent Contract V3 audit passed' \
+            -f 'output[summary]=Linux and Windows full-scope signed audits passed for the exact candidate tarball.'

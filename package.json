@@ -1,0 +1,24 @@
+{
+  "name": "project-tiny-context-harness-audit",
+  "version": "0.1.0",
+  "description": "Independent black-box and real-consumer audit for Project Tiny Context Harness Contract V3 candidates",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "ty-context-external-audit": "src/cli.mjs"
+  },
+  "files": [
+    "src",
+    "fixtures",
+    "expected-outcomes.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "audit": "node src/cli.mjs",
+    "self-test": "node src/cli.mjs --self-test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
